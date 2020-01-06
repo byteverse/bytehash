@@ -1,5 +1,6 @@
 {-# language BangPatterns #-}
 {-# language MagicHash #-}
+{-# language TypeApplications #-}
 
 -- | Hash functions for byte sequences of a bounded size.
 module Data.Bytes.Hash
@@ -8,75 +9,154 @@ module Data.Bytes.Hash
   , entropy
   ) where
 
-import Data.Bytes.Types (Bytes(Bytes))
-import Data.Void (Void)
-import GHC.Exts (Ptr(Ptr))
-import Data.Word (Word64)
-import Data.Primitive (ByteArray,sizeofByteArray)
-import Data.Bits ((.&.),complement,unsafeShiftL)
-import Data.Primitive.Ptr (indexOffPtr)
-import Foreign.Ptr (castPtr)
+-- Implementation Notes
+--
+-- We use the length as the initial accumulator. This prevents byte
+-- sequences of null bytes from hashing to the same value.
+--
+-- We perform a byte swap at the end. Technically, you are supposed to
+-- perform a division at the end to throw away some of the lower bits.
+-- This accomplishes something similar (preferring the upper bits).
+--
+-- We effectively pad all byte sequences with zeroes on the right-hand
+-- side. This means we can terminate early once we run out of bytes
+-- since all remaining additions would just be zero. We use a little-endian
+-- interpretation of the underlying bytes along with some clever bit-shifting
+-- to handle the incomplete machine word at the end of the byte sequence.
+-- We read past the end of the array, but we zero out the invalid bytes
+-- with conjunction. 
 
-import Data.Primitive.ByteArray.BigEndian (indexByteArray,indexUnalignedByteArray)
+import Data.Bits ((.&.),complement,unsafeShiftL)
+import Data.Bytes.Types (Bytes(Bytes))
+import Data.Primitive (ByteArray,sizeofByteArray)
+import Data.Primitive.ByteArray.LittleEndian (indexByteArray,indexUnalignedByteArray)
+import Data.Primitive.Ptr (indexOffPtr)
+import Data.Void (Void)
+import Data.Word (Word64)
+import Foreign.Ptr (castPtr)
+import Foreign.Storable (sizeOf)
+import GHC.Exts (Ptr(Ptr))
+import GHC.Word (Word(W#))
+
+import qualified GHC.Exts as Exts
 
 -- | Hash a byte sequence.
 bytes ::
      Ptr Void -- ^ Entropy, should be an @Addr#@ literal
-  -> Int -- ^ Number of 64-bit words of entropy
   -> Bytes -- ^ Bytes to hash
-  -> Word64
-bytes !addr !sz (Bytes arr off0 len0) = go (sz - 1) off0 len0 0 where
+  -> Word
+bytes !addr (Bytes arr off0 len0) =
+  go 0 off0 len0 (indexOffPtr (castPtr addr) 0 * fromIntegral @Int @Word len0)
+  where
   -- The ptr index is in Word64 elements. The array index is in bytes.
   -- The remaining size is in bytes.
-  go :: Int -> Int -> Int -> Word64 -> Word64
-  go !ixPtr !ixArr !szB !acc = if szB >= 8
+  go :: Int -> Int -> Int -> Word -> Word
+  go !ixPtr !ixArr !szB !acc = if szB >= wordSize
     then go
-      (ixPtr - 1)
-      (ixArr + 8)
-      (szB - 8)
-      (acc + ((indexOffPtr (castPtr addr) ixPtr :: Word64) * (indexUnalignedByteArray arr ixArr :: Word64)))
-    else acc + 
-      ( (indexOffPtr (castPtr addr) ixPtr :: Word64) *
-        ((indexUnalignedByteArray arr ixArr :: Word64) .&. (complement ((unsafeShiftL 1 (szB * 8)) - 1)))
+      (ixPtr + 1)
+      (ixArr + wordSize)
+      (szB - wordSize)
+      (acc + ((indexOffPtr (castPtr addr) ixPtr :: Word) * (indexUnalignedByteArray arr ixArr :: Word)))
+    else byteSwap $ acc + 
+      ( (indexOffPtr (castPtr addr) ixPtr :: Word) *
+        ((indexUnalignedByteArray arr ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
       )
 
 -- | Hash a byte array. This takes advantage of the machine-word alignment
 -- guarantee that GHC provides for byte arrays.
 byteArray ::
      Ptr Void -- ^ Entropy, should be an @Addr#@ literal
-  -> Int -- ^ Number of 64-bit words of entropy
   -> ByteArray -- ^ Bytes to hash
-  -> Word64
-byteArray !addr !sz !b = go (sz - 1) 0 (sizeofByteArray b) 0 where
+  -> Word
+byteArray !addr !b =
+  go 0 0 sz (indexOffPtr (castPtr addr) 0 * fromIntegral @Int @Word sz)
+  where
+  !sz = sizeofByteArray b
   -- The indices are in Word64 elements. The remaining size is in bytes.
-  go :: Int -> Int -> Int -> Word64 -> Word64
-  go !ixPtr !ixArr !szB !acc = if szB >= 8
+  go :: Int -> Int -> Int -> Word -> Word
+  go !ixPtr !ixArr !szB !acc = if szB >= wordSize
     then go
-      (ixPtr - 1)
+      (ixPtr + 1)
       (ixArr + 1)
-      (szB - 8)
-      (acc + ((indexOffPtr (castPtr addr) ixPtr :: Word64) * (indexByteArray b ixArr :: Word64)))
-    else acc + 
-      ( (indexOffPtr (castPtr addr) ixPtr :: Word64) *
-        ((indexByteArray b ixArr :: Word64) .&. (complement ((unsafeShiftL 1 (szB * 8)) - 1)))
+      (szB - wordSize)
+      (acc + ((indexOffPtr (castPtr addr) ixPtr :: Word) * (indexByteArray b ixArr :: Word)))
+    else byteSwap $ acc + 
+      ( (indexOffPtr (castPtr addr) ixPtr :: Word) *
+        ((indexByteArray b ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
       )
 
--- | Statically-defined source of entropy. Contains 256 bytes.
+wordSize :: Int
+wordSize = sizeOf (undefined :: Word)
+
+byteSwap :: Word -> Word
+{-# inline byteSwap #-}
+byteSwap (W# w) = W# (Exts.byteSwap# w)
+
+-- | Statically-defined source of entropy. Contains 256 bytes. All of these
+-- bytes are odd numbers.
 entropy :: Ptr Void
 entropy = Ptr "\
-\11b8d61da8e062d6db1dc67710feab1c\
-\2331e4ce6958755b1fa3b72f734b002a\
-\1655b7745f2f162a5b088d1da4fdaaf7\
-\c12968e2750c2bc7cce778f5c0fe8088\
-\9984bdb2c493550f789ad4194b1dc4ff\
-\5047c9db2bde9810c308370819cc55a7\
-\7488981676f42e1e4c584bba4a35e788\
-\64ae5a806dffbdfa0698f11c5406487e\
-\7435db7b6abb4cdf1888e7638f08123b\
-\8f8d1d003bb1a257c757d3b57d11a33f\
-\dffe33f2bdcbac67250b6aa361d35f73\
-\8d6dcaf7f25f2db137098049d7ecaf34\
-\fa67b5d8820dadd05a63435acd56106e\
-\6989f6c4337514558aeee378ee38eb05\
-\8f5e1e5dad76ad752085e21fb8d300bf\
-\5b171e125559b159aa9e6da09090bc2d"#
+\33fddd7b\
+\9b1f3d5b\
+\7dfff135\
+\fdfffb1d\
+\df779db5\
+\ffb95bdb\
+\1f39d73f\
+\531bb959\
+\59fbb13b\
+\9d73db31\
+\b591579b\
+\99333357\
+\f5d93f1f\
+\7559b971\
+\9fb7d5d1\
+\f9915fdd\
+\715f9b55\
+\911f1b55\
+\bdffb5b3\
+\b577f177\
+\7519fd7d\
+\dbb75f79\
+\319b399d\
+\711f555d\
+\bf997733\
+\d133995d\
+\17315171\
+\15537d15\
+\5f1f973d\
+\15dbd5ff\
+\db59f5b5\
+\971f59f5\
+\b5b11b73\
+\377bbbfd\
+\f9d5f951\
+\31b3d71b\
+\1bd19fd5\
+\9f11dd13\
+\157773b3\
+\dd319791\
+\5597d151\
+\135f37fb\
+\1511bd57\
+\b97113f5\
+\7719bd57\
+\3d79795d\
+\b9fdb937\
+\7bfb3395\
+\7539f1b3\
+\7f1fd3f5\
+\75bb799b\
+\f13bbf39\
+\37b7dd97\
+\3951d3bf\
+\73b15111\
+\97b7fbd7\
+\b35f3db7\
+\b3b195d1\
+\fd1b57b5\
+\59d79df1\
+\55dd13b9\
+\7d1b3b75\
+\b19f15dd\
+\f13f31df"#
