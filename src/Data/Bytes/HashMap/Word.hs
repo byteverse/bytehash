@@ -128,24 +128,27 @@ lookup (Bytes (ByteArray arr) (I# off) (I# len)) (Map (SmallArray m)) =
 
 lookup# :: Bytes# -> Map# -> (# (# #) | Word# #)
 {-# noinline lookup# #-}
-lookup# needle' m' =
-  let needle = boxBytes needle'
-      Map sarrOuter = boxMap m'
-      !outerHash = remBase2Divisor (w2i (Hash.bytes Hash.entropy needle)) (PMSA.sizeofSmallArray sarrOuter) in
-  case PMSA.indexSmallArray sarrOuter outerHash of
-    CellZero -> (# (# #) | #)
-    CellOne ba (W# v) -> if bytesEqualsByteArray needle ba
-      then (# | v #)
-      else (# (# #) | #)
-    CellMany entropy sarrInner ->
-      let !innerHash = remBase2Divisor
-            (w2i (Hash.bytes entropy needle))
-            (PMSA.sizeofSmallArray sarrInner) in
-      case PMSA.indexSmallArray sarrInner innerHash of
-        InfoAbsent -> (# (# #) | #)
-        InfoPresent ba (W# v) -> if bytesEqualsByteArray needle ba
-          then (# | v #)
-          else (# (# #) | #)
+lookup# needle' m' = if B.length needle < 128
+  then
+    let !outerHash = remBase2Divisor (w2i (Hash.bytes Hash.entropy needle)) (PMSA.sizeofSmallArray sarrOuter) in
+    case PMSA.indexSmallArray sarrOuter outerHash of
+      CellZero -> (# (# #) | #)
+      CellOne ba (W# v) -> if bytesEqualsByteArray needle ba
+        then (# | v #)
+        else (# (# #) | #)
+      CellMany entropy sarrInner ->
+        let !innerHash = remBase2Divisor
+              (w2i (Hash.bytes entropy needle))
+              (PMSA.sizeofSmallArray sarrInner) in
+        case PMSA.indexSmallArray sarrInner innerHash of
+          InfoAbsent -> (# (# #) | #)
+          InfoPresent ba (W# v) -> if bytesEqualsByteArray needle ba
+            then (# | v #)
+            else (# (# #) | #)
+  else (# (# #) | #)
+  where
+  needle = boxBytes needle'
+  Map sarrOuter = boxMap m'
 
 boxMap :: Map# -> Map
 boxMap a = Map (SmallArray a)
