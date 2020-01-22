@@ -26,27 +26,24 @@ module Data.Bytes.Hash
 -- We read past the end of the array, but we zero out the invalid bytes
 -- with conjunction. 
 
-import Data.Bits ((.&.),complement,unsafeShiftL)
+import Data.Bits ((.&.),unsafeShiftL)
 import Data.Bytes.Types (Bytes(Bytes))
 import Data.Primitive (ByteArray,sizeofByteArray)
 import Data.Primitive.ByteArray.LittleEndian (indexByteArray,indexUnalignedByteArray)
-import Data.Primitive.Ptr (indexOffPtr)
 import Data.Void (Void)
-import Data.Word (Word64)
-import Foreign.Ptr (castPtr)
 import Foreign.Storable (sizeOf)
 import GHC.Exts (Ptr(Ptr))
 import GHC.Word (Word(W#))
 
 import qualified GHC.Exts as Exts
 
--- | Hash a byte sequence.
+-- | Hash a byte sequence of length @n@.
 bytes ::
-     Ptr Void -- ^ Entropy, should be an @Addr#@ literal
+     ByteArray -- ^ Entropy, must be at least @W + (⌈n / W⌉ * W)@ bytes
   -> Bytes -- ^ Bytes to hash
   -> Word
 bytes !addr (Bytes arr off0 len0) =
-  go 0 off0 len0 (indexOffPtr (castPtr addr) 0 * fromIntegral @Int @Word len0)
+  go 1 off0 len0 (indexByteArray addr 0 * fromIntegral @Int @Word (len0 + 1))
   where
   -- The ptr index is in Word64 elements. The array index is in bytes.
   -- The remaining size is in bytes.
@@ -56,20 +53,20 @@ bytes !addr (Bytes arr off0 len0) =
       (ixPtr + 1)
       (ixArr + wordSize)
       (szB - wordSize)
-      (acc + ((indexOffPtr (castPtr addr) ixPtr :: Word) * (indexUnalignedByteArray arr ixArr :: Word)))
+      (acc + ((indexByteArray addr ixPtr :: Word) * (indexUnalignedByteArray arr ixArr :: Word)))
     else byteSwap $ acc + 
-      ( (indexOffPtr (castPtr addr) ixPtr :: Word) *
+      ( (indexByteArray addr ixPtr :: Word) *
         ((indexUnalignedByteArray arr ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
       )
 
--- | Hash a byte array. This takes advantage of the machine-word alignment
--- guarantee that GHC provides for byte arrays.
+-- | Hash a byte array of length @n@. This takes advantage of the
+-- machine-word alignment guarantee that GHC provides for byte arrays.
 byteArray ::
-     Ptr Void -- ^ Entropy, should be an @Addr#@ literal
+     ByteArray -- ^ Entropy, must be at least @W + (⌈n / W⌉ * W)@ bytes
   -> ByteArray -- ^ Bytes to hash
   -> Word
 byteArray !addr !b =
-  go 0 0 sz (indexOffPtr (castPtr addr) 0 * fromIntegral @Int @Word sz)
+  go 1 0 sz (indexByteArray addr 0 * fromIntegral @Int @Word (sz + 1))
   where
   !sz = sizeofByteArray b
   -- The indices are in Word64 elements. The remaining size is in bytes.
@@ -79,9 +76,9 @@ byteArray !addr !b =
       (ixPtr + 1)
       (ixArr + 1)
       (szB - wordSize)
-      (acc + ((indexOffPtr (castPtr addr) ixPtr :: Word) * (indexByteArray b ixArr :: Word)))
+      (acc + ((indexByteArray addr ixPtr :: Word) * (indexByteArray b ixArr :: Word)))
     else byteSwap $ acc + 
-      ( (indexOffPtr (castPtr addr) ixPtr :: Word) *
+      ( (indexByteArray addr ixPtr :: Word) *
         ((indexByteArray b ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
       )
 
