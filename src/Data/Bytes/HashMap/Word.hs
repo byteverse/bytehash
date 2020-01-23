@@ -24,17 +24,18 @@ import Data.Bits ((.&.),complement)
 import Data.Bytes.Types (Bytes(Bytes))
 import Data.Foldable (for_,foldlM)
 import Data.Primitive (ByteArray,ByteArray(..),PrimArray(..))
-import Data.Primitive.SmallArray (SmallArray(..))
-import GHC.Exts (Int(I#),SmallArray#,ByteArray#,ArrayArray#,Int#,Word#)
+import GHC.Exts (Int(I#),ByteArray#,ArrayArray#,Int#,Word#)
 import GHC.Word (Word(W#))
-import GHC.IO.Handle.Internals (ioe_EOF)
-import System.IO (Handle)
 import Data.Primitive.Unlifted.Array (UnliftedArray(..))
+import System.Entropy (CryptHandle,hGetEntropy)
 
+import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Unsafe as ByteString
 import qualified Data.Bytes as Bytes
 import qualified Data.List as List
 import qualified Data.Bytes.Hash as Hash
 import qualified Data.Primitive as PM
+import qualified Data.Primitive.Ptr as PM
 import qualified Data.Primitive.Unlifted.Array as PM
 import qualified GHC.Exts as Exts
 
@@ -48,7 +49,7 @@ data Map = Map
   !(UnliftedArray ByteArray) -- keys
   !(PrimArray Word) -- values
 
-fromList :: Handle -> [(Bytes,Word)] -> IO Map
+fromList :: CryptHandle -> [(Bytes,Word)] -> IO Map
 fromList h = fromListWith h const
 
 lookup :: Bytes -> Map -> Maybe Word
@@ -87,7 +88,7 @@ unsafeRem :: Word -> Word -> Word
 unsafeRem (W# a) (W# b) = W# (Exts.remWord# a b)
 
 fromListWith ::
-     Handle -- ^ Source of randomness (use @/dev/urandom@ if uncertain)
+     CryptHandle -- ^ Source of randomness (use @/dev/urandom@ if uncertain)
   -> (Word -> Word -> Word)
   -> [(Bytes,Word)]
   -> IO Map
@@ -162,9 +163,15 @@ fromListWith h combine xs
     ) (List.groupBy (\(x,_) (y,_) -> x == y) (List.sortOn fst xs))
   count = List.length @[] xs' :: Int
 
-findInitialEntropy :: Handle -> Int -> Int -> Int -> [(Bytes,Word)] -> IO ByteArray
+findInitialEntropy ::
+     CryptHandle
+  -> Int
+  -> Int
+  -> Int
+  -> [(Bytes,v)]
+  -> IO ByteArray
 {-# SCC findInitialEntropy #-}
-findInitialEntropy h maxLen' count allowedCollisions xs = do
+findInitialEntropy !h !maxLen' !count !allowedCollisions xs = do
   entropy <- askForEntropy h maxLen'
   let maxCollisions = List.foldl'
         (\acc zs -> max acc (List.length @[] zs))
@@ -178,17 +185,19 @@ findInitialEntropy h maxLen' count allowedCollisions xs = do
     then pure entropy
     else findInitialEntropy h maxLen' count allowedCollisions xs
 
-askForEntropy :: Handle -> Int -> IO ByteArray
-askForEntropy h !n = do
-  entropy <- Bytes.hGet h n
-  when (Bytes.length entropy /= n) ioe_EOF
-  pure (Bytes.toByteArrayClone entropy)
+askForEntropy :: CryptHandle -> Int -> IO ByteArray
+askForEntropy !h !n = do
+  entropy <- hGetEntropy h n
+  when (ByteString.length entropy /= n)
+    (fail "bytehash: askForEntropy failed, blame entropy")
+  dst <- PM.newByteArray n
+  ByteString.unsafeUseAsCStringLen entropy $ \(ptr, len) -> do
+    let !(PM.MutableByteArray primDst) = dst
+    PM.copyPtrToMutablePrimArray (PM.MutablePrimArray primDst) 0 ptr len
+  PM.unsafeFreezeByteArray dst
     
 requiredEntropy :: Word -> Word
 requiredEntropy n = ((n - 1) .&. complement 0b111) + 16
-
-errorThunk :: a
-errorThunk = error "Data.Bytes.HashMap: mistake"
 
 unsafeHeadFst :: [(a,b)] -> a
 unsafeHeadFst ((x,_) : _) = x
