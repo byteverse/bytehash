@@ -1,5 +1,9 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BinaryLiterals #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE DeriveFoldable #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE RankNTypes #-}
@@ -49,6 +53,7 @@ data Map v = Map
   !(UnliftedArray ByteArray) -- entropies
   !(UnliftedArray ByteArray) -- keys
   !(SmallArray v) -- values
+  deriving stock (Functor,Foldable,Traversable)
 
 fromList :: CryptHandle -> [(Bytes,v)] -> IO (Map v)
 fromList h = fromListWith h const
