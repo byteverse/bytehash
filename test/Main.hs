@@ -12,6 +12,7 @@ import Test.Tasty.HUnit (testCase,assertEqual,Assertion,(@=?))
 import Test.Tasty.Hedgehog (testProperty)
 import Control.Monad.IO.Class (liftIO)
 import System.IO (openBinaryFile,Handle,IOMode(ReadMode))
+import System.Entropy (CryptHandle,openHandle)
 
 import qualified Data.Bytes as Bytes
 import qualified Data.Bytes.Hash as Hash
@@ -21,10 +22,10 @@ import qualified GHC.Exts as Exts
 
 main :: IO ()
 main = do
-  rand <- openBinaryFile "/dev/urandom" ReadMode
+  rand <- openHandle
   defaultMain (tests rand)
 
-tests :: Handle -> TestTree
+tests :: CryptHandle -> TestTree
 tests rand = testGroup "bytehash"
   [ testCase "A" (Hash.bytes myEntropy fooBytesA @=? Hash.bytes myEntropy fooBytesB)
   , testCase "B" (Hash.bytes myEntropy fooBytesA @=? Hash.byteArray myEntropy fooByteArray)
@@ -82,7 +83,7 @@ myEntropy = Exts.fromList
   , 0x42,0x13,0x12,0x05,0xFF,0x42,0x13,0x12,0x05,0xFF
   ]
 
-byteTableLookupProp :: Handle -> Property
+byteTableLookupProp :: CryptHandle -> Property
 byteTableLookupProp rand = property $ do
   bytesList <- forAll $ list (linear 0 48) genBytes
   let pairs = map (\x -> (x,x)) bytesList
@@ -107,7 +108,7 @@ genOffset originalLen = integral (linear 0 maxDiscard)
   where
   maxDiscard = min 19 (div originalLen 3)
 
-byteTableLookupA :: Handle -> IO ()
+byteTableLookupA :: CryptHandle -> IO ()
 byteTableLookupA h = do
   let bs :: [(Bytes,Bytes)]
       bs = map (\x -> (Exts.fromList x, Exts.fromList x))
