@@ -33,7 +33,7 @@ import Data.Primitive.ByteArray.LittleEndian (indexByteArray,indexUnalignedByteA
 import Data.Void (Void)
 import Foreign.Storable (sizeOf)
 import GHC.Exts (Ptr(Ptr))
-import GHC.Word (Word(W#))
+import GHC.Word (Word(W#),Word8)
 
 import qualified GHC.Exts as Exts
 
@@ -54,10 +54,7 @@ bytes !addr (Bytes arr off0 len0) =
       (ixArr + wordSize)
       (szB - wordSize)
       (acc + ((indexByteArray addr ixPtr :: Word) * (indexUnalignedByteArray arr ixArr :: Word)))
-    else byteSwap $ acc + 
-      ( (indexByteArray addr ixPtr :: Word) *
-        ((indexUnalignedByteArray arr ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
-      )
+    else acc + (indexByteArray addr ixPtr * finalWord arr ixArr szB)
 
 -- | Hash a byte array of length @n@. This takes advantage of the
 -- machine-word alignment guarantee that GHC provides for byte arrays.
@@ -77,10 +74,14 @@ byteArray !addr !b =
       (ixArr + 1)
       (szB - wordSize)
       (acc + ((indexByteArray addr ixPtr :: Word) * (indexByteArray b ixArr :: Word)))
-    else byteSwap $ acc + 
-      ( (indexByteArray addr ixPtr :: Word) *
-        ((indexByteArray b ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
-      )
+    else acc + (indexByteArray addr ixPtr * finalWord b (ixArr * wordSize) szB)
+
+-- Precondition: len is less than the size of a word
+finalWord :: ByteArray -> Int -> Int -> Word
+finalWord !arr !off0 !len0 = go 0 off0 len0 where
+  go !acc !_ !0 = acc
+  go !acc !off !len =
+    go (256 * acc + fromIntegral @Word8 @Word (indexByteArray @Word8 arr off)) (off + 1) (len - 1)
 
 wordSize :: Int
 wordSize = sizeOf (undefined :: Word)
