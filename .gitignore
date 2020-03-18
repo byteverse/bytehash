@@ -25,3 +25,4 @@ stack.yaml
 *.swo
 *.swp
 test_results/**
+ghc-assertions/

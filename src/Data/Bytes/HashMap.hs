@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BinaryLiterals #-}
+{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveFunctor #-}
@@ -18,10 +19,13 @@ module Data.Bytes.HashMap
   , lookup
   , fromList
   , fromListWith
+    -- * Used for testing
+  , HashMapException(..)
   ) where
 
 import Prelude hiding (lookup)
 
+import Control.Exception (Exception,throwIO)
 import Control.Monad (when)
 import Data.Bits ((.&.),complement)
 import Data.Bytes.Types (Bytes(Bytes))
@@ -31,7 +35,7 @@ import Data.Primitive (ByteArray,ByteArray(..))
 import Data.Primitive.SmallArray (SmallArray(..))
 import Data.Primitive.Unlifted.Array (UnliftedArray(..))
 import GHC.Exts (Int(I#),SmallArray#,ByteArray#,ArrayArray#,Int#)
-import GHC.Word (Word(W#))
+import GHC.Word (Word(W#),Word32)
 import System.Entropy (CryptHandle,hGetEntropy)
 
 import qualified Data.ByteString as ByteString
@@ -75,9 +79,9 @@ lookup# ::
 lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #)
   | sz == 0 = (# (# #) | #)
   | PM.sizeofByteArray entropyA < reqEntropy = (# (# #) | #)
-  | entropyB <- PM.indexUnliftedArray entropies (w2i (unsafeRem (Hash.bytes entropyA key) (i2w sz))),
+  | entropyB <- PM.indexUnliftedArray entropies (w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz))),
     PM.sizeofByteArray entropyB >= reqEntropy,
-    ix <- w2i (unsafeRem (Hash.bytes entropyB key) (i2w sz)),
+    ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz)),
     bytesEqualsByteArray key (PM.indexUnliftedArray keys ix),
     (# v #) <- PM.indexSmallArray## vals ix = (# | v #)
   | otherwise = (# (# #) | #)
@@ -110,7 +114,7 @@ fromListWith h combine xs
             (List.groupBy (\(x,_) (y,_) -> x == y)
               (List.sortOn fst
                 (List.map
-                  (\(b,v) -> (rem (Hash.bytes entropyA b) (i2w count), (b,v)))
+                  (\(b,v) -> (rem (fromIntegral @Word32 @Word (Hash.bytes entropyA b)) (i2w count), (b,v)))
                   xs'
                 )
               )
@@ -125,16 +129,16 @@ fromListWith h combine xs
             let ix = w2i (unsafeHeadFst x)
                 keyVals = map snd x
                 maxGroupLen = List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 keyVals
-            goC ix keyVals (w2i (requiredEntropy (i2w maxGroupLen))) ps
+            goC 100000 ix keyVals (w2i (requiredEntropy (i2w maxGroupLen))) ps
           {-# SCC goC #-}
-          goC :: Int -> [(Bytes,v)] -> Int -> [[(Word,(Bytes,v))]] -> IO ()
-          goC ix keyVals entropySz zs = do
+          goC :: Int -> Int -> [(Bytes,v)] -> Int -> [[(Word,(Bytes,v))]] -> IO ()
+          goC !counter !ix keyVals !entropySz zs = do
             entropy <- askForEntropy h entropySz
             tmpUsed <- PM.cloneSmallMutableArray used 0 count
             allGood <- foldlM
               (\good (key,_) -> if good
                 then do
-                  let j = fromIntegral @Word @Int (rem (Hash.bytes entropy key) (i2w count))
+                  let j = fromIntegral @Word @Int (rem (upW32 (Hash.bytes entropy key)) (i2w count))
                   PM.readSmallArray tmpUsed j >>= \case
                     True -> pure False
                     False -> do
@@ -146,12 +150,16 @@ fromListWith h combine xs
               then do
                 PM.writeUnliftedArray entropies ix entropy
                 for_ keyVals $ \(key,val) -> do
-                  let j = fromIntegral @Word @Int (rem (Hash.bytes entropy key) (i2w count))
+                  let j = fromIntegral @Word @Int (rem (fromIntegral @Word32 @Word (Hash.bytes entropy key)) (i2w count))
                   PM.writeSmallArray used j True
                   PM.writeUnliftedArray keys j (Bytes.toByteArray key)
                   PM.writeSmallArray values j val
                 goB zs
-              else goC ix keyVals entropySz zs
+              else case counter of
+                0 -> throwIO $ HashMapException count
+                  (map fst keyVals)
+                  ((fmap.fmap.fmap) fst groups)
+                _ -> goC (counter - 1) ix keyVals entropySz zs
       goB groups
       vals' <- PM.unsafeFreezeSmallArray values
       keys' <- PM.unsafeFreezeUnliftedArray keys
@@ -176,19 +184,24 @@ findInitialEntropy ::
   -> [(Bytes,v)]
   -> IO ByteArray
 {-# SCC findInitialEntropy #-}
-findInitialEntropy !h !maxLen' !count !allowedCollisions xs = do
-  entropy <- askForEntropy h maxLen'
-  let maxCollisions = List.foldl'
-        (\acc zs -> max acc (List.length @[] zs))
-        0
-        (List.group
-          (List.sort
-            (map (\(b,_) -> rem (Hash.bytes entropy b) (i2w count)) xs)
+findInitialEntropy !h !maxLen' !count !allowedCollisions xs = go 40
+  where 
+  go :: Int -> IO ByteArray
+  go !ix = do
+    entropy <- askForEntropy h maxLen'
+    let maxCollisions = List.foldl'
+          (\acc zs -> max acc (List.length @[] zs))
+          0
+          (List.group
+            (List.sort
+              (map (\(b,_) -> rem (fromIntegral @Word32 @Word (Hash.bytes entropy b)) (i2w count)) xs)
+            )
           )
-        )
-  if maxCollisions <= allowedCollisions
-    then pure entropy
-    else findInitialEntropy h maxLen' count allowedCollisions xs
+    if maxCollisions <= allowedCollisions
+      then pure entropy
+      else case ix of
+        0 -> throwIO (HashMapException (-1) [] [])
+        _ -> go (ix - 1)
 
 askForEntropy :: CryptHandle -> Int -> IO ByteArray
 askForEntropy !h !n = do
@@ -202,7 +215,7 @@ askForEntropy !h !n = do
   PM.unsafeFreezeByteArray dst
     
 requiredEntropy :: Word -> Word
-requiredEntropy n = ((n - 1) .&. complement 0b111) + 16
+requiredEntropy n = 8 * n + 8
 
 errorThunk :: a
 errorThunk = error "Data.Bytes.HashMap: mistake"
@@ -217,6 +230,9 @@ w2i = fromIntegral
 i2w :: Int -> Word
 i2w = fromIntegral
 
+upW32 :: Word32 -> Word
+upW32 = fromIntegral
+
 bytesEqualsByteArray :: Bytes -> ByteArray -> Bool 
 bytesEqualsByteArray (Bytes arr1 off1 len1) arr2
   | len1 /= PM.sizeofByteArray arr2 = False
@@ -225,6 +241,10 @@ bytesEqualsByteArray (Bytes arr1 off1 len1) arr2
 compareByteArrays :: ByteArray -> Int -> ByteArray -> Int -> Int -> Ordering
 compareByteArrays (ByteArray ba1#) (I# off1#) (ByteArray ba2#) (I# off2#) (I# n#) =
   compare (I# (Exts.compareByteArrays# ba1# off1# ba2# off2# n#)) 0
+
+data HashMapException = HashMapException !Int [Bytes] [[(Word,Bytes)]]
+  deriving stock (Show,Eq)
+  deriving anyclass (Exception)
 
 -- debugPrint :: Show v => Map v -> IO ()
 -- debugPrint (Map entropy entropies keys vals) = do
