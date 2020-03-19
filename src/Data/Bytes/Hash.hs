@@ -26,61 +26,47 @@ module Data.Bytes.Hash
 -- We read past the end of the array, but we zero out the invalid bytes
 -- with conjunction. 
 
-import Data.Bits ((.&.),unsafeShiftL)
+import Data.Bits ((.&.),(.|.),unsafeShiftL,unsafeShiftR)
 import Data.Bytes.Types (Bytes(Bytes))
-import Data.Primitive (ByteArray,sizeofByteArray)
-import Data.Primitive.ByteArray.LittleEndian (indexByteArray,indexUnalignedByteArray)
+import Data.Primitive (ByteArray,sizeofByteArray,indexByteArray)
+-- import Data.Primitive.ByteArray.LittleEndian (indexByteArray,indexUnalignedByteArray)
 import Data.Void (Void)
 import Foreign.Storable (sizeOf)
 import GHC.Exts (Ptr(Ptr))
-import GHC.Word (Word(W#))
+import GHC.Word (Word(W#),Word8,Word32,Word64)
 
+import qualified Data.Bytes as Bytes
 import qualified GHC.Exts as Exts
 
 -- | Hash a byte sequence of length @n@.
 bytes ::
-     ByteArray -- ^ Entropy, must be at least @W + (⌈n / W⌉ * W)@ bytes
+     ByteArray -- ^ Entropy, must be at least @(W + 1) * 8@ bytes
   -> Bytes -- ^ Bytes to hash
-  -> Word
+  -> Word32
 bytes !addr (Bytes arr off0 len0) =
-  go 1 off0 len0 (indexByteArray addr 0 * fromIntegral @Int @Word (len0 + 1))
+  go 0 off0 len0 (indexByteArray @Word64 addr len0)
   where
   -- The ptr index is in Word64 elements. The array index is in bytes.
   -- The remaining size is in bytes.
-  go :: Int -> Int -> Int -> Word -> Word
-  go !ixPtr !ixArr !szB !acc = if szB >= wordSize
-    then go
-      (ixPtr + 1)
-      (ixArr + wordSize)
-      (szB - wordSize)
-      (acc + ((indexByteArray addr ixPtr :: Word) * (indexUnalignedByteArray arr ixArr :: Word)))
-    else byteSwap $ acc + 
-      ( (indexByteArray addr ixPtr :: Word) *
-        ((indexUnalignedByteArray arr ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
+  go :: Int -> Int -> Int -> Word64 -> Word32
+  go !ixPtr !ixArr !len !acc = case len of
+    0 -> fromIntegral @Word64 @Word32 (unsafeShiftR acc 32)
+    _ -> go (ixPtr + 1) (ixArr + 1) (len - 1)
+      ( acc
+        +
+        ( indexByteArray addr ixPtr
+          *
+          fromIntegral @Word8 @Word64 (indexByteArray @Word8 arr ixArr)
+        )
       )
 
 -- | Hash a byte array of length @n@. This takes advantage of the
 -- machine-word alignment guarantee that GHC provides for byte arrays.
 byteArray ::
-     ByteArray -- ^ Entropy, must be at least @W + (⌈n / W⌉ * W)@ bytes
+     ByteArray -- ^ Entropy, must be at least @(W + 1) * 8@ bytes
   -> ByteArray -- ^ Bytes to hash
-  -> Word
-byteArray !addr !b =
-  go 1 0 sz (indexByteArray addr 0 * fromIntegral @Int @Word (sz + 1))
-  where
-  !sz = sizeofByteArray b
-  -- The indices are in Word64 elements. The remaining size is in bytes.
-  go :: Int -> Int -> Int -> Word -> Word
-  go !ixPtr !ixArr !szB !acc = if szB >= wordSize
-    then go
-      (ixPtr + 1)
-      (ixArr + 1)
-      (szB - wordSize)
-      (acc + ((indexByteArray addr ixPtr :: Word) * (indexByteArray b ixArr :: Word)))
-    else byteSwap $ acc + 
-      ( (indexByteArray addr ixPtr :: Word) *
-        ((indexByteArray b ixArr :: Word) .&. ((unsafeShiftL 1 (szB * wordSize)) - 1))
-      )
+  -> Word32
+byteArray !addr !b = bytes addr (Bytes.fromByteArray b)
 
 wordSize :: Int
 wordSize = sizeOf (undefined :: Word)

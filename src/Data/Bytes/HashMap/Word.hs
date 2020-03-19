@@ -25,7 +25,7 @@ import Data.Bytes.Types (Bytes(Bytes))
 import Data.Foldable (for_,foldlM)
 import Data.Primitive (ByteArray,ByteArray(..),PrimArray(..))
 import GHC.Exts (Int(I#),ByteArray#,ArrayArray#,Int#,Word#)
-import GHC.Word (Word(W#))
+import GHC.Word (Word(W#),Word32)
 import Data.Primitive.Unlifted.Array (UnliftedArray(..))
 import System.Entropy (CryptHandle,hGetEntropy)
 
@@ -69,9 +69,9 @@ lookup# ::
 lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #)
   | sz == 0 = (# (# #) | #)
   | PM.sizeofByteArray entropyA < reqEntropy = (# (# #) | #)
-  | entropyB <- PM.indexUnliftedArray entropies (w2i (unsafeRem (Hash.bytes entropyA key) (i2w sz))),
+  | entropyB <- PM.indexUnliftedArray entropies (w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz))),
     PM.sizeofByteArray entropyB >= reqEntropy,
-    ix <- w2i (unsafeRem (Hash.bytes entropyB key) (i2w sz)),
+    ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz)),
     bytesEqualsByteArray key (PM.indexUnliftedArray keys ix),
     W# v <- PM.indexPrimArray vals ix = (# | v #)
   | otherwise = (# (# #) | #)
@@ -104,7 +104,7 @@ fromListWith h combine xs
             (List.groupBy (\(x,_) (y,_) -> x == y)
               (List.sortOn fst
                 (List.map
-                  (\(b,v) -> (rem (Hash.bytes entropyA b) (i2w count), (b,v)))
+                  (\(b,v) -> (rem (upW32 (Hash.bytes entropyA b)) (i2w count), (b,v)))
                   xs'
                 )
               )
@@ -129,7 +129,7 @@ fromListWith h combine xs
             allGood <- foldlM
               (\good (key,_) -> if good
                 then do
-                  let j = fromIntegral @Word @Int (rem (Hash.bytes entropy key) (i2w count))
+                  let j = fromIntegral @Word @Int (rem (upW32 (Hash.bytes entropy key)) (i2w count))
                   PM.readSmallArray tmpUsed j >>= \case
                     True -> pure False
                     False -> do
@@ -141,7 +141,7 @@ fromListWith h combine xs
               then do
                 PM.writeUnliftedArray entropies ix entropy
                 for_ keyVals $ \(key,val) -> do
-                  let j = fromIntegral @Word @Int (rem (Hash.bytes entropy key) (i2w count))
+                  let j = fromIntegral @Word @Int (rem (upW32 (Hash.bytes entropy key)) (i2w count))
                   PM.writeSmallArray used j True
                   PM.writeUnliftedArray keys j (Bytes.toByteArray key)
                   PM.writePrimArray values j val
@@ -178,7 +178,7 @@ findInitialEntropy !h !maxLen' !count !allowedCollisions xs = do
         0
         (List.group
           (List.sort
-            (map (\(b,_) -> rem (Hash.bytes entropy b) (i2w count)) xs)
+            (map (\(b,_) -> rem (upW32 (Hash.bytes entropy b)) (i2w count)) xs)
           )
         )
   if maxCollisions <= allowedCollisions
@@ -197,7 +197,7 @@ askForEntropy !h !n = do
   PM.unsafeFreezeByteArray dst
     
 requiredEntropy :: Word -> Word
-requiredEntropy n = ((n - 1) .&. complement 0b111) + 16
+requiredEntropy n = 8 * n + 8 -- ((n - 1) .&. complement 0b111) + 16
 
 unsafeHeadFst :: [(a,b)] -> a
 unsafeHeadFst ((x,_) : _) = x
@@ -208,6 +208,9 @@ w2i = fromIntegral
 
 i2w :: Int -> Word
 i2w = fromIntegral
+
+upW32 :: Word32 -> Word
+upW32 = fromIntegral
 
 bytesEqualsByteArray :: Bytes -> ByteArray -> Bool 
 bytesEqualsByteArray (Bytes arr1 off1 len1) arr2
