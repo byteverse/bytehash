@@ -13,29 +13,23 @@ module Data.Bytes.HashMap.Word
   ( Map
   , lookup
   , fromList
+  , fromTrustedList
   , fromListWith
   ) where
 
 import Prelude hiding (lookup)
 
-import Data.Ord (Down(Down))
-import Control.Monad (when)
-import Data.Bits ((.&.),complement)
 import Data.Bytes.Types (Bytes(Bytes))
-import Data.Foldable (for_,foldlM)
 import Data.Primitive (ByteArray,ByteArray(..),PrimArray(..))
 import GHC.Exts (Int(I#),ByteArray#,ArrayArray#,Int#,Word#)
 import GHC.Word (Word(W#),Word32)
 import Data.Primitive.Unlifted.Array (UnliftedArray(..))
-import System.Entropy (CryptHandle,hGetEntropy)
+import System.Entropy (CryptHandle)
 
-import qualified Data.ByteString as ByteString
-import qualified Data.ByteString.Unsafe as ByteString
 import qualified Data.Bytes as Bytes
-import qualified Data.List as List
 import qualified Data.Bytes.Hash as Hash
+import qualified Data.Bytes.HashMap as Lifted
 import qualified Data.Primitive as PM
-import qualified Data.Primitive.Ptr as PM
 import qualified Data.Primitive.Unlifted.Array as PM
 import qualified GHC.Exts as Exts
 
@@ -49,8 +43,26 @@ data Map = Map
   !(UnliftedArray ByteArray) -- keys
   !(PrimArray Word) -- values
 
+fromLifted :: Lifted.Map Word -> Map
+fromLifted (Lifted.Map a b c d) = Map a b c (Exts.fromList (Exts.toList d))
+
 fromList :: CryptHandle -> [(Bytes,Word)] -> IO Map
-fromList h = fromListWith h const
+fromList h = fmap fromLifted . Lifted.fromList h
+
+fromListWith ::
+     CryptHandle -- ^ Source of randomness
+  -> (Word -> Word -> Word)
+  -> [(Bytes,Word)]
+  -> IO Map
+fromListWith h c xs = fmap fromLifted (Lifted.fromListWith h c xs)
+
+-- | Build a map from keys that are known at compile time.
+-- All keys must be 64 bytes or less. This uses a built-in source
+-- of entropy and is entirely deterministic. An adversarial user
+-- could feed this function keys that cause it to error out rather
+-- than completing.
+fromTrustedList :: [(Bytes,Word)] -> Map
+fromTrustedList = fromLifted . Lifted.fromTrustedList
 
 lookup :: Bytes -> Map -> Maybe Word
 {-# inline lookup #-}
@@ -87,130 +99,14 @@ lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #
 unsafeRem :: Word -> Word -> Word
 unsafeRem (W# a) (W# b) = W# (Exts.remWord# a b)
 
-fromListWith ::
-     CryptHandle -- ^ Source of randomness (use @/dev/urandom@ if uncertain)
-  -> (Word -> Word -> Word)
-  -> [(Bytes,Word)]
-  -> IO Map
-fromListWith h combine xs
-  | count == 0 = pure (Map mempty mempty mempty mempty)
-  | otherwise = do
-      let maxLen' = w2i $ requiredEntropy $ i2w $
-            List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 xs'
-          allowedCollisions = ceiling (sqrt (fromIntegral @Int @Double (count + 1))) :: Int
-      entropyA <- findInitialEntropy h maxLen' count allowedCollisions xs'
-      let groups :: [[(Word,(Bytes,Word))]]
-          groups = List.sortOn (Down . List.length @[])
-            (List.groupBy (\(x,_) (y,_) -> x == y)
-              (List.sortOn fst
-                (List.map
-                  (\(b,v) -> (rem (upW32 (Hash.bytes entropyA b)) (i2w count), (b,v)))
-                  xs'
-                )
-              )
-            )
-      used <- PM.newSmallArray count False
-      keys <- PM.newUnliftedArray count (mempty :: ByteArray)
-      values <- PM.newPrimArray count
-      PM.setPrimArray values 0 count (0 :: Word)
-      entropies <- PM.newUnliftedArray count (mempty :: ByteArray)
-      let {-# SCC goB #-}
-          goB [] = pure ()
-          goB (x : ps) = do
-            let ix = w2i (unsafeHeadFst x)
-                keyVals = map snd x
-                maxGroupLen = List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 keyVals
-            goC ix keyVals (w2i (requiredEntropy (i2w maxGroupLen))) ps
-          {-# SCC goC #-}
-          goC :: Int -> [(Bytes,Word)] -> Int -> [[(Word,(Bytes,Word))]] -> IO ()
-          goC ix keyVals entropySz zs = do
-            entropy <- askForEntropy h entropySz
-            tmpUsed <- PM.cloneSmallMutableArray used 0 count
-            allGood <- foldlM
-              (\good (key,_) -> if good
-                then do
-                  let j = fromIntegral @Word @Int (rem (upW32 (Hash.bytes entropy key)) (i2w count))
-                  PM.readSmallArray tmpUsed j >>= \case
-                    True -> pure False
-                    False -> do
-                      PM.writeSmallArray tmpUsed j True
-                      pure True
-                else pure False
-              ) True keyVals
-            if allGood
-              then do
-                PM.writeUnliftedArray entropies ix entropy
-                for_ keyVals $ \(key,val) -> do
-                  let j = fromIntegral @Word @Int (rem (upW32 (Hash.bytes entropy key)) (i2w count))
-                  PM.writeSmallArray used j True
-                  PM.writeUnliftedArray keys j (Bytes.toByteArray key)
-                  PM.writePrimArray values j val
-                goB zs
-              else goC ix keyVals entropySz zs
-      goB groups
-      vals' <- PM.unsafeFreezePrimArray values
-      keys' <- PM.unsafeFreezeUnliftedArray keys
-      entropies' <- PM.unsafeFreezeUnliftedArray entropies
-      pure (Map entropyA entropies' keys' vals')
-  where
-  -- Combine duplicates upfront.
-  xs' :: [(Bytes,Word)]
-  xs' = map
-    (\rs ->
-      ( unsafeHeadFst rs
-      , List.foldl1' combine (map snd rs)
-      )
-    ) (List.groupBy (\(x,_) (y,_) -> x == y) (List.sortOn fst xs))
-  count = List.length @[] xs' :: Int
-
-findInitialEntropy ::
-     CryptHandle
-  -> Int
-  -> Int
-  -> Int
-  -> [(Bytes,v)]
-  -> IO ByteArray
-{-# SCC findInitialEntropy #-}
-findInitialEntropy !h !maxLen' !count !allowedCollisions xs = do
-  entropy <- askForEntropy h maxLen'
-  let maxCollisions = List.foldl'
-        (\acc zs -> max acc (List.length @[] zs))
-        0
-        (List.group
-          (List.sort
-            (map (\(b,_) -> rem (upW32 (Hash.bytes entropy b)) (i2w count)) xs)
-          )
-        )
-  if maxCollisions <= allowedCollisions
-    then pure entropy
-    else findInitialEntropy h maxLen' count allowedCollisions xs
-
-askForEntropy :: CryptHandle -> Int -> IO ByteArray
-askForEntropy !h !n = do
-  entropy <- hGetEntropy h n
-  when (ByteString.length entropy /= n)
-    (fail "bytehash: askForEntropy failed, blame entropy")
-  dst <- PM.newByteArray n
-  ByteString.unsafeUseAsCStringLen entropy $ \(ptr, len) -> do
-    let !(PM.MutableByteArray primDst) = dst
-    PM.copyPtrToMutablePrimArray (PM.MutablePrimArray primDst) 0 ptr len
-  PM.unsafeFreezeByteArray dst
-    
-requiredEntropy :: Word -> Word
-requiredEntropy n = 8 * n + 8 -- ((n - 1) .&. complement 0b111) + 16
-
-unsafeHeadFst :: [(a,b)] -> a
-unsafeHeadFst ((x,_) : _) = x
-unsafeHeadFst [] = error "Data.Bytes.HashMap: bad use of unsafeHeadFst"
-
-w2i :: Word -> Int
-w2i = fromIntegral
-
 i2w :: Int -> Word
 i2w = fromIntegral
 
-upW32 :: Word32 -> Word
-upW32 = fromIntegral
+requiredEntropy :: Word -> Word
+requiredEntropy n = 8 * n + 8
+
+w2i :: Word -> Int
+w2i = fromIntegral
 
 bytesEqualsByteArray :: Bytes -> ByteArray -> Bool 
 bytesEqualsByteArray (Bytes arr1 off1 len1) arr2
@@ -221,12 +117,5 @@ compareByteArrays :: ByteArray -> Int -> ByteArray -> Int -> Int -> Ordering
 compareByteArrays (ByteArray ba1#) (I# off1#) (ByteArray ba2#) (I# off2#) (I# n#) =
   compare (I# (Exts.compareByteArrays# ba1# off1# ba2# off2# n#)) 0
 
--- debugPrint :: Map -> IO ()
--- debugPrint (Map entropy entropies keys vals) = do
---   putStrLn ("Tier 1 Entropy: " ++ show entropy)
---   putStrLn "Tier 2 Entropies:"
---   PM.traverseUnliftedArray_ print entropies
---   putStrLn "Keys:"
---   PM.traverseUnliftedArray_ print keys
---   putStrLn "Values:"
---   for_ vals print 
+upW32 :: Word32 -> Word
+upW32 = fromIntegral

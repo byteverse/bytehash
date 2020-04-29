@@ -7,6 +7,7 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -15,9 +16,10 @@
 
 -- | Implementation of static hash map data structure.
 module Data.Bytes.HashMap
-  ( Map
+  ( Map(..)
   , lookup
   , fromList
+  , fromTrustedList
   , fromListWith
     -- * Used for testing
   , HashMapException(..)
@@ -25,8 +27,10 @@ module Data.Bytes.HashMap
 
 import Prelude hiding (lookup)
 
-import Control.Exception (Exception,throwIO)
+import Control.Exception (Exception,throw)
 import Control.Monad (when)
+import Control.Monad.ST (ST,stToIO,runST)
+import Control.Monad.Trans.Except (ExceptT(ExceptT),runExceptT)
 import Data.Bits ((.&.),complement)
 import Data.Bytes.Types (Bytes(Bytes))
 import Data.Foldable (for_,foldlM)
@@ -34,8 +38,12 @@ import Data.Ord (Down(Down))
 import Data.Primitive (ByteArray,ByteArray(..))
 import Data.Primitive.SmallArray (SmallArray(..))
 import Data.Primitive.Unlifted.Array (UnliftedArray(..))
-import GHC.Exts (Int(I#),SmallArray#,ByteArray#,ArrayArray#,Int#)
-import GHC.Word (Word(W#),Word32)
+import Data.STRef (STRef,newSTRef,writeSTRef,readSTRef)
+import Foreign.Ptr (plusPtr)
+import GHC.Exts (Ptr(Ptr),Int(I#),SmallArray#,ByteArray#,ArrayArray#,Int#)
+import GHC.Exts (RealWorld)
+import GHC.IO (ioToST)
+import GHC.Word (Word(W#),Word32,Word8)
 import System.Entropy (CryptHandle,hGetEntropy)
 
 import qualified Data.ByteString as ByteString
@@ -59,8 +67,20 @@ data Map v = Map
   !(SmallArray v) -- values
   deriving stock (Functor,Foldable,Traversable)
 
+-- | Build a static hash map. This may be used on input that comes
+-- from an adversarial user. It always produces a perfect hash map.
 fromList :: CryptHandle -> [(Bytes,v)] -> IO (Map v)
 fromList h = fromListWith h const
+
+-- | Build a map from keys that are known at compile time.
+-- All keys must be 64 bytes or less. This uses a built-in source
+-- of entropy and is entirely deterministic. An adversarial user
+-- could feed this function keys that cause it to error out rather
+-- than completing.
+fromTrustedList :: [(Bytes,v)] -> Map v
+fromTrustedList xs = runST $ do
+  ref <- newSTRef 0
+  fromListWithGen ref askForEntropyST const xs
 
 lookup :: Bytes -> Map v -> Maybe v
 {-# inline lookup #-}
@@ -97,18 +117,19 @@ lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #
 unsafeRem :: Word -> Word -> Word
 unsafeRem (W# a) (W# b) = W# (Exts.remWord# a b)
 
-fromListWith :: forall v.
-     CryptHandle -- ^ Source of randomness
+fromListWithGen :: forall a s v.
+     a -- ^ Source of randomness
+  -> (a -> Int -> ST s ByteArray)
   -> (v -> v -> v)
   -> [(Bytes,v)]
-  -> IO (Map v)
-fromListWith h combine xs
+  -> ST s (Map v)
+fromListWithGen h ask combine xs
   | count == 0 = pure (Map mempty mempty mempty mempty)
   | otherwise = do
       let maxLen' = w2i $ requiredEntropy $ i2w $
             List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 xs'
           allowedCollisions = ceiling (sqrt (fromIntegral @Int @Double (count + 1))) :: Int
-      entropyA <- findInitialEntropy h maxLen' count allowedCollisions xs'
+      entropyA <- findInitialEntropy h ask maxLen' count allowedCollisions xs'
       let groups :: [[(Word,(Bytes,v))]]
           groups = List.sortOn (Down . List.length @[])
             (List.groupBy (\(x,_) (y,_) -> x == y)
@@ -124,16 +145,35 @@ fromListWith h combine xs
       values <- PM.newSmallArray count (errorThunk @v)
       entropies <- PM.newUnliftedArray count (mempty :: ByteArray)
       let {-# SCC goB #-}
-          goB [] = pure ()
-          goB (x : ps) = do
+          goB :: [ByteArray] -> [[(Word,(Bytes,v))]] -> ST s ()
+          goB !_ [] = pure ()
+          goB !cache (x : ps) = do
             let ix = w2i (unsafeHeadFst x)
                 keyVals = map snd x
-                maxGroupLen = List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 keyVals
-            goC 100000 ix keyVals (w2i (requiredEntropy (i2w maxGroupLen))) ps
-          {-# SCC goC #-}
-          goC :: Int -> Int -> [(Bytes,v)] -> Int -> [[(Word,(Bytes,v))]] -> IO ()
-          goC !counter !ix keyVals !entropySz zs = do
-            entropy <- askForEntropy h entropySz
+                !maxGroupLen = List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 keyVals
+                reqEntrSz = w2i (requiredEntropy (i2w maxGroupLen))
+            -- First, we try out all options from the cache. If we can
+            -- reuse random bytes that were used for a different key,
+            -- we can save a lot of space. Reuse is frequently possible.
+            e <- runExceptT $ for_ cache $ \entropy -> if PM.sizeofByteArray entropy >= reqEntrSz 
+              then ExceptT $ attempt entropy ix keyVals >>= \case
+                True -> pure (Left ())
+                False -> pure (Right ())
+              else ExceptT (pure (Right ()))
+            case e of
+              Left () -> goB cache ps
+              Right () -> do
+                goD cache 100000 ix keyVals reqEntrSz ps
+          updateSlots :: ByteArray -> Int -> [(Bytes,v)] -> ST s ()
+          updateSlots !entropy !ix keyVals = do
+            PM.writeUnliftedArray entropies ix entropy
+            for_ keyVals $ \(key,val) -> do
+              let j = fromIntegral @Word @Int (rem (fromIntegral @Word32 @Word (Hash.bytes entropy key)) (i2w count))
+              PM.writeSmallArray used j True
+              PM.writeUnliftedArray keys j (Bytes.toByteArray key)
+              PM.writeSmallArray values j val
+          attempt :: ByteArray -> Int -> [(Bytes,v)] -> ST s Bool
+          attempt !entropy !ix keyVals = do
             tmpUsed <- PM.cloneSmallMutableArray used 0 count
             allGood <- foldlM
               (\good (key,_) -> if good
@@ -148,19 +188,21 @@ fromListWith h combine xs
               ) True keyVals
             if allGood
               then do
-                PM.writeUnliftedArray entropies ix entropy
-                for_ keyVals $ \(key,val) -> do
-                  let j = fromIntegral @Word @Int (rem (fromIntegral @Word32 @Word (Hash.bytes entropy key)) (i2w count))
-                  PM.writeSmallArray used j True
-                  PM.writeUnliftedArray keys j (Bytes.toByteArray key)
-                  PM.writeSmallArray values j val
-                goB zs
-              else case counter of
-                0 -> throwIO $ HashMapException count
+                updateSlots entropy ix keyVals
+                pure True
+              else pure False
+          {-# SCC goD #-}
+          goD :: [ByteArray] -> Int -> Int -> [(Bytes,v)] -> Int -> [[(Word,(Bytes,v))]] -> ST s ()
+          goD !cache !counter !ix keyVals !entropySz zs = do
+            entropy <- ask h entropySz
+            attempt entropy ix keyVals >>= \case
+              True -> goB (entropy : cache) zs
+              False -> case counter of
+                0 -> throw $ HashMapException count
                   (map fst keyVals)
                   ((fmap.fmap.fmap) fst groups)
-                _ -> goC (counter - 1) ix keyVals entropySz zs
-      goB groups
+                _ -> goD cache (counter - 1) ix keyVals entropySz zs
+      goB [entropyA] groups
       vals' <- PM.unsafeFreezeSmallArray values
       keys' <- PM.unsafeFreezeUnliftedArray keys
       entropies' <- PM.unsafeFreezeUnliftedArray entropies
@@ -176,19 +218,29 @@ fromListWith h combine xs
     ) (List.groupBy (\(x,_) (y,_) -> x == y) (List.sortOn fst xs))
   count = List.length @[] xs' :: Int
 
-findInitialEntropy ::
-     CryptHandle
+
+fromListWith :: forall v.
+     CryptHandle -- ^ Source of randomness
+  -> (v -> v -> v)
+  -> [(Bytes,v)]
+  -> IO (Map v)
+fromListWith h combine xs = stToIO
+  (fromListWithGen h askForEntropy combine xs)
+
+findInitialEntropy :: forall s a v.
+     a
+  -> (a -> Int -> ST s ByteArray)
   -> Int
   -> Int
   -> Int
   -> [(Bytes,v)]
-  -> IO ByteArray
+  -> ST s ByteArray
 {-# SCC findInitialEntropy #-}
-findInitialEntropy !h !maxLen' !count !allowedCollisions xs = go 40
+findInitialEntropy !h ask !maxLen' !count !allowedCollisions xs = go 40
   where 
-  go :: Int -> IO ByteArray
+  go :: Int -> ST s ByteArray
   go !ix = do
-    entropy <- askForEntropy h maxLen'
+    entropy <- ask h maxLen'
     let maxCollisions = List.foldl'
           (\acc zs -> max acc (List.length @[] zs))
           0
@@ -200,11 +252,25 @@ findInitialEntropy !h !maxLen' !count !allowedCollisions xs = go 40
     if maxCollisions <= allowedCollisions
       then pure entropy
       else case ix of
-        0 -> throwIO (HashMapException (-1) [] [])
+        0 -> throw (HashMapException (-1) [] [])
         _ -> go (ix - 1)
 
-askForEntropy :: CryptHandle -> Int -> IO ByteArray
-askForEntropy !h !n = do
+askForEntropyST :: STRef s Int -> Int -> ST s ByteArray
+askForEntropyST !ref !n = do
+  counter <- readSTRef ref
+  writeSTRef ref $! mod (counter + 1) 8192
+  let (_,r) = divMod n 8
+  if | r /= 0 -> error "bytehash: askForEntropyST, request does not divide 8"
+     | n > 8192 -> error "bytehash: askForEntropyST, requested more than 8192"
+     | otherwise -> do
+         dst <- PM.newPrimArray n
+         PM.copyPtrToMutablePrimArray dst 0
+           (plusPtr Hash.entropy counter :: Ptr Word8) n
+         PM.PrimArray x <- PM.unsafeFreezePrimArray dst
+         pure (ByteArray x)
+
+askForEntropy :: CryptHandle -> Int -> ST RealWorld ByteArray
+askForEntropy !h !n = ioToST $ do
   entropy <- hGetEntropy h n
   when (ByteString.length entropy /= n)
     (fail "bytehash: askForEntropy failed, blame entropy")
