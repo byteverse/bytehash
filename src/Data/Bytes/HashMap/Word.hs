@@ -15,11 +15,15 @@ module Data.Bytes.HashMap.Word
   , fromList
   , fromTrustedList
   , fromListWith
+    -- * Used for testing
+  , distribution
+  , distinctEntropies
   ) where
 
 import Prelude hiding (lookup)
 
 import Data.Bytes.Types (Bytes(Bytes))
+import Data.Int (Int32)
 import Data.Primitive (ByteArray,ByteArray(..),PrimArray(..))
 import GHC.Exts (Int(I#),ByteArray#,ArrayArray#,Int#,Word#)
 import GHC.Word (Word(W#),Word32)
@@ -29,6 +33,7 @@ import System.Entropy (CryptHandle)
 import qualified Data.Bytes as Bytes
 import qualified Data.Bytes.Hash as Hash
 import qualified Data.Bytes.HashMap as Lifted
+import qualified Data.List as List
 import qualified Data.Primitive as PM
 import qualified Data.Primitive.Unlifted.Array as PM
 import qualified GHC.Exts as Exts
@@ -40,11 +45,12 @@ import qualified GHC.Exts as Exts
 data Map = Map
   !ByteArray -- top-level entropy
   !(UnliftedArray ByteArray) -- entropies
+  !(PrimArray Int32) -- offset to apply to hash, could probably be 32 bits
   !(UnliftedArray ByteArray) -- keys
   !(PrimArray Word) -- values
 
 fromLifted :: Lifted.Map Word -> Map
-fromLifted (Lifted.Map a b c d) = Map a b c (Exts.fromList (Exts.toList d))
+fromLifted (Lifted.Map a b c d e) = Map a b c d (Exts.fromList (Exts.toList e))
 
 fromList :: CryptHandle -> [(Bytes,Word)] -> IO Map
 fromList h = fmap fromLifted . Lifted.fromList h
@@ -68,24 +74,27 @@ lookup :: Bytes -> Map -> Maybe Word
 {-# inline lookup #-}
 lookup
   (Bytes (ByteArray keyArr) (I# keyOff) (I# keyLen))
-  (Map (ByteArray entropyA) (UnliftedArray entropies) (UnliftedArray keys) (PrimArray vals)) =
-    case lookup# (# keyArr,keyOff,keyLen #) (# entropyA,entropies,keys,vals #) of
+  (Map (ByteArray entropyA) (UnliftedArray entropies) (PrimArray offsets) (UnliftedArray keys) (PrimArray vals)) =
+    case lookup# (# keyArr,keyOff,keyLen #) (# entropyA,entropies,offsets,keys,vals #) of
       (# (# #) | #) -> Nothing
       (# | v #) -> Just (W# v)
 
 lookup# ::
      (# ByteArray#, Int#, Int# #)
-  -> (# ByteArray#, ArrayArray#, ArrayArray#, ByteArray# #)
+  -> (# ByteArray#, ArrayArray#, ByteArray#, ArrayArray#, ByteArray# #)
   -> (# (# #) | Word# #)
 {-# noinline lookup# #-}
-lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #)
+lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys#, vals# #)
   | sz == 0 = (# (# #) | #)
   | PM.sizeofByteArray entropyA < reqEntropy = (# (# #) | #)
-  | entropyB <- PM.indexUnliftedArray entropies (w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz))),
+  | ixA <- w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz)),
+    entropyB <- PM.indexUnliftedArray entropies ixA,
     PM.sizeofByteArray entropyB >= reqEntropy,
     ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz)),
-    bytesEqualsByteArray key (PM.indexUnliftedArray keys ix),
-    W# v <- PM.indexPrimArray vals ix = (# | v #)
+    offset <- fromIntegral @Int32 @Int (PM.indexPrimArray offsets ixA),
+    offsetIx <- offset + ix,
+    bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx),
+    W# v <- PM.indexPrimArray vals offsetIx = (# | v #)
   | otherwise = (# (# #) | #)
   where
   sz = PM.sizeofUnliftedArray entropies
@@ -95,6 +104,7 @@ lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #
   entropies = UnliftedArray entropies# :: UnliftedArray ByteArray
   keys = UnliftedArray keys# :: UnliftedArray ByteArray
   vals = PrimArray vals# :: PrimArray Word
+  offsets = PrimArray offsets# :: PrimArray Int32
 
 unsafeRem :: Word -> Word -> Word
 unsafeRem (W# a) (W# b) = W# (Exts.remWord# a b)
@@ -119,3 +129,12 @@ compareByteArrays (ByteArray ba1#) (I# off1#) (ByteArray ba2#) (I# off2#) (I# n#
 
 upW32 :: Word32 -> Word
 upW32 = fromIntegral
+
+distribution :: Map -> [(Int,Int)]
+distribution (Map entropy entropies offsets keys vals) = Lifted.distribution
+  (Lifted.Map entropy entropies offsets keys (Exts.fromList (Exts.toList vals)))
+
+-- | The number of non-matching entropies being used.
+distinctEntropies :: Map -> Int
+distinctEntropies (Map entropy entropies _ _ _) =
+  List.length (List.group (List.sort (entropy : Exts.toList entropies)))

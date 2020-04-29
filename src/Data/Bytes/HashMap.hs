@@ -23,6 +23,8 @@ module Data.Bytes.HashMap
   , fromListWith
     -- * Used for testing
   , HashMapException(..)
+  , distribution
+  , distinctEntropies
   ) where
 
 import Prelude hiding (lookup)
@@ -34,8 +36,9 @@ import Control.Monad.Trans.Except (ExceptT(ExceptT),runExceptT)
 import Data.Bits ((.&.),complement)
 import Data.Bytes.Types (Bytes(Bytes))
 import Data.Foldable (for_,foldlM)
+import Data.Int (Int32)
 import Data.Ord (Down(Down))
-import Data.Primitive (ByteArray,ByteArray(..))
+import Data.Primitive (ByteArray(..),PrimArray(..))
 import Data.Primitive.SmallArray (SmallArray(..))
 import Data.Primitive.Unlifted.Array (UnliftedArray(..))
 import Data.STRef (STRef,newSTRef,writeSTRef,readSTRef)
@@ -63,6 +66,7 @@ import qualified GHC.Exts as Exts
 data Map v = Map
   !ByteArray -- top-level entropy
   !(UnliftedArray ByteArray) -- entropies
+  !(PrimArray Int32) -- offset to apply to hash, could probably be 32 bits
   !(UnliftedArray ByteArray) -- keys
   !(SmallArray v) -- values
   deriving stock (Functor,Foldable,Traversable)
@@ -86,24 +90,27 @@ lookup :: Bytes -> Map v -> Maybe v
 {-# inline lookup #-}
 lookup
   (Bytes (ByteArray keyArr) (I# keyOff) (I# keyLen))
-  (Map (ByteArray entropyA) (UnliftedArray entropies) (UnliftedArray keys) (SmallArray vals)) =
-    case lookup# (# keyArr,keyOff,keyLen #) (# entropyA,entropies,keys,vals #) of
+  (Map (ByteArray entropyA) (UnliftedArray entropies) (PrimArray offsets) (UnliftedArray keys) (SmallArray vals)) =
+    case lookup# (# keyArr,keyOff,keyLen #) (# entropyA,entropies,offsets,keys,vals #) of
       (# (# #) | #) -> Nothing
       (# | v #) -> Just v
 
 lookup# ::
      (# ByteArray#, Int#, Int# #)
-  -> (# ByteArray#, ArrayArray#, ArrayArray#, SmallArray# v #)
+  -> (# ByteArray#, ArrayArray#, ByteArray#, ArrayArray#, SmallArray# v #)
   -> (# (# #) | v #)
 {-# noinline lookup# #-}
-lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #)
+lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys#, vals# #)
   | sz == 0 = (# (# #) | #)
   | PM.sizeofByteArray entropyA < reqEntropy = (# (# #) | #)
-  | entropyB <- PM.indexUnliftedArray entropies (w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz))),
+  | ixA <- w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz)),
+    entropyB <- PM.indexUnliftedArray entropies ixA,
     PM.sizeofByteArray entropyB >= reqEntropy,
     ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz)),
-    bytesEqualsByteArray key (PM.indexUnliftedArray keys ix),
-    (# v #) <- PM.indexSmallArray## vals ix = (# | v #)
+    offset <- fromIntegral @Int32 @Int (PM.indexPrimArray offsets ixA),
+    offsetIx <- offset + ix,
+    bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx),
+    (# v #) <- PM.indexSmallArray## vals offsetIx = (# | v #)
   | otherwise = (# (# #) | #)
   where
   sz = PM.sizeofUnliftedArray entropies
@@ -113,6 +120,7 @@ lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, keys#, vals# #
   entropies = UnliftedArray entropies# :: UnliftedArray ByteArray
   keys = UnliftedArray keys# :: UnliftedArray ByteArray
   vals = SmallArray vals#
+  offsets = PrimArray offsets# :: PrimArray Int32
 
 unsafeRem :: Word -> Word -> Word
 unsafeRem (W# a) (W# b) = W# (Exts.remWord# a b)
@@ -124,7 +132,7 @@ fromListWithGen :: forall a s v.
   -> [(Bytes,v)]
   -> ST s (Map v)
 fromListWithGen h ask combine xs
-  | count == 0 = pure (Map mempty mempty mempty mempty)
+  | count == 0 = pure (Map mempty mempty mempty mempty mempty)
   | otherwise = do
       let maxLen' = w2i $ requiredEntropy $ i2w $
             List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 xs'
@@ -144,26 +152,46 @@ fromListWithGen h ask combine xs
       keys <- PM.newUnliftedArray count (mempty :: ByteArray)
       values <- PM.newSmallArray count (errorThunk @v)
       entropies <- PM.newUnliftedArray count (mempty :: ByteArray)
+      offsets <- PM.newPrimArray count
+      PM.setPrimArray offsets 0 count (0 :: Int32)
       let {-# SCC goB #-}
           goB :: [ByteArray] -> [[(Word,(Bytes,v))]] -> ST s ()
           goB !_ [] = pure ()
-          goB !cache (x : ps) = do
-            let ix = w2i (unsafeHeadFst x)
-                keyVals = map snd x
-                !maxGroupLen = List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 keyVals
-                reqEntrSz = w2i (requiredEntropy (i2w maxGroupLen))
-            -- First, we try out all options from the cache. If we can
-            -- reuse random bytes that were used for a different key,
-            -- we can save a lot of space. Reuse is frequently possible.
-            e <- runExceptT $ for_ cache $ \entropy -> if PM.sizeofByteArray entropy >= reqEntrSz 
-              then ExceptT $ attempt entropy ix keyVals >>= \case
-                True -> pure (Left ())
-                False -> pure (Right ())
-              else ExceptT (pure (Right ()))
-            case e of
-              Left () -> goB cache ps
-              Right () -> do
-                goD cache 100000 ix keyVals reqEntrSz ps
+          goB !cache (x : ps) = case x of
+            [(w,(key,val))] -> do
+              -- Space optimization for singleton buckets. If only one key
+              -- hashed to a bucket, we just use entropyA as the entropy
+              -- since it is guaranteed to be big enough. Then we use the
+              -- offset field to correct the hash. This avoid creating any
+              -- additional entropy byte arrays for singleton buckets.
+              -- Technically, it should be possible to do this for some
+              -- of the doubletons as well. It is just a little more
+              -- difficult.
+              let ix = w2i (unsafeHeadFst x)
+              j <- findUnused used
+              PM.writeUnliftedArray entropies ix entropyA
+              PM.writePrimArray offsets ix (fromIntegral @Int @Int32 (j - fromIntegral w))
+              PM.writeSmallArray used j True
+              PM.writeUnliftedArray keys j (Bytes.toByteArray key)
+              PM.writeSmallArray values j val
+              goB cache ps
+            _ -> do
+              let ix = w2i (unsafeHeadFst x)
+                  keyVals = map snd x
+                  !maxGroupLen = List.foldl' (\acc (b,_) -> max (Bytes.length b) acc) 0 keyVals
+                  reqEntrSz = w2i (requiredEntropy (i2w maxGroupLen))
+              -- As a space optimization, we try out all options from the cache.
+              -- If we can reuse random bytes that were used for a different key,
+              -- we can save a lot of space. Reuse is frequently possible.
+              e <- runExceptT $ for_ cache $ \entropy -> if PM.sizeofByteArray entropy >= reqEntrSz 
+                then ExceptT $ attempt entropy ix keyVals >>= \case
+                  True -> pure (Left ())
+                  False -> pure (Right ())
+                else ExceptT (pure (Right ()))
+              case e of
+                Left () -> goB cache ps
+                Right () -> do
+                  goD cache 100000 ix keyVals reqEntrSz ps
           updateSlots :: ByteArray -> Int -> [(Bytes,v)] -> ST s ()
           updateSlots !entropy !ix keyVals = do
             PM.writeUnliftedArray entropies ix entropy
@@ -206,7 +234,8 @@ fromListWithGen h ask combine xs
       vals' <- PM.unsafeFreezeSmallArray values
       keys' <- PM.unsafeFreezeUnliftedArray keys
       entropies' <- PM.unsafeFreezeUnliftedArray entropies
-      pure (Map entropyA entropies' keys' vals')
+      offsets' <- PM.unsafeFreezePrimArray offsets
+      pure (Map entropyA entropies' offsets' keys' vals')
   where
   -- Combine duplicates upfront.
   xs' :: [(Bytes,v)]
@@ -217,6 +246,17 @@ fromListWithGen h ask combine xs
       )
     ) (List.groupBy (\(x,_) (y,_) -> x == y) (List.sortOn fst xs))
   count = List.length @[] xs' :: Int
+
+findUnused :: PM.SmallMutableArray s Bool -> ST s Int
+findUnused xs = go 0
+  where
+  len = PM.sizeofSmallMutableArray xs
+  go !ix = if ix < len
+    then do
+      PM.readSmallArray xs ix >>= \case
+        True -> go (ix + 1)
+        False -> pure ix
+    else error "findUnused: could not find unused slot"
 
 
 fromListWith :: forall v.
@@ -312,12 +352,31 @@ data HashMapException = HashMapException !Int [Bytes] [[(Word,Bytes)]]
   deriving stock (Show,Eq)
   deriving anyclass (Exception)
 
--- debugPrint :: Show v => Map v -> IO ()
--- debugPrint (Map entropy entropies keys vals) = do
---   putStrLn ("Tier 1 Entropy: " ++ show entropy)
---   putStrLn "Tier 2 Entropies:"
---   PM.traverseUnliftedArray_ print entropies
---   putStrLn "Keys:"
---   PM.traverseUnliftedArray_ print keys
---   putStrLn "Values:"
---   for_ vals print 
+-- | For each slot, gives the number of keys that hash to it
+-- after the first hash function has been applied.
+distribution :: Map v -> [(Int,Int)]
+distribution (Map entropy entropies _ keys _) =
+  let counts = runST $ do
+        let sz = PM.sizeofUnliftedArray entropies
+        dst <- PM.newPrimArray sz
+        PM.setPrimArray dst 0 sz (0 :: Int)
+        let go !ix = case ix of
+              (-1) -> pure ()
+              _ -> do
+                let key = PM.indexUnliftedArray keys ix
+                let ixA = w2i (unsafeRem (upW32 (Hash.byteArray entropy key)) (i2w sz))
+                old <- PM.readPrimArray dst ixA
+                PM.writePrimArray dst ixA (old + 1)
+                go (ix - 1)
+        go (sz - 1)
+        PM.unsafeFreezePrimArray dst
+   in List.sort $ List.map
+        ( \xs -> case xs of
+          [] -> errorWithoutStackTrace "bytehash: distribution impl error"
+          y : _ -> (y,List.length xs)
+        ) (List.group (List.sort (Exts.toList counts)))
+
+-- | The number of non-matching entropies being used.
+distinctEntropies :: Map v -> Int
+distinctEntropies (Map entropy entropies _ _ _) =
+  List.length (List.group (List.sort (entropy : Exts.toList entropies)))
