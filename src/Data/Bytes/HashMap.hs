@@ -16,7 +16,7 @@
 
 -- | Implementation of static hash map data structure.
 module Data.Bytes.HashMap
-  ( Map(..)
+  ( Map
   , lookup
   , fromList
   , fromTrustedList
@@ -27,6 +27,28 @@ module Data.Bytes.HashMap
   , distinctEntropies
   ) where
 
+-- Implementation notes. This module uses a variant of the technique
+-- described in http://stevehanov.ca/blog/?id=119 with the big difference
+-- being that we do not throw away the keys. You can only throw away the
+-- keys in very specific problem domains where you somehow control
+-- everything that is going to be looked up.
+--
+-- General implementation thoughts. It would be really nice to figure
+-- out how to parallelize hashing. We currently go one byte at a time.
+-- Processing more bytes at a time would cut down on memory loads.
+-- However, doing more than one byte at a time is tricky. When you
+-- get to the end of a string, you end up having to do some extra
+-- finagling to make sure you do not read past the end. I have tried
+-- to do this in the past, and it is difficult to do it correctly.
+--
+-- Other thought: Using a random 64-bit word for each byte is pretty
+-- heavy handed. 64-bit words give us 32-bit hashes, but in most cases,
+-- we are not building maps that are that big. We really only need
+-- 16-bit hashes most of the time (maps with less than 64K values).
+-- Switching to 32-bit words would save space. Plus, if we did this,
+-- we could also use SSE _mm_add_epi32 and _mm_add_epi32 to process
+-- four bytes at a time.
+
 import Prelude hiding (lookup)
 
 import Control.Exception (Exception,throw)
@@ -34,6 +56,7 @@ import Control.Monad (when)
 import Control.Monad.ST (ST,stToIO,runST)
 import Control.Monad.Trans.Except (ExceptT(ExceptT),runExceptT)
 import Data.Bits ((.&.),complement)
+import Data.Bytes.HashMap.Internal (Map(Map))
 import Data.Bytes.Types (Bytes(Bytes))
 import Data.Foldable (for_,foldlM)
 import Data.Int (Int32)
@@ -59,18 +82,6 @@ import qualified Data.Primitive.Ptr as PM
 import qualified Data.Primitive.Unlifted.Array as PM
 import qualified GHC.Exts as Exts
 
--- | A static perfect hash table where the keys are byte arrays. This
---   table cannot be updated after its creation, but all lookups have
---   guaranteed O(1) worst-case cost. It consumes linear space. This
---   is an excellent candidate for use with compact regions.
-data Map v = Map
-  !ByteArray -- top-level entropy
-  !(UnliftedArray ByteArray) -- entropies
-  !(PrimArray Int32) -- offset to apply to hash, could probably be 32 bits
-  !(UnliftedArray ByteArray) -- keys
-  !(SmallArray v) -- values
-  deriving stock (Functor,Foldable,Traversable)
-
 -- | Build a static hash map. This may be used on input that comes
 -- from an adversarial user. It always produces a perfect hash map.
 fromList :: CryptHandle -> [(Bytes,v)] -> IO (Map v)
@@ -86,6 +97,7 @@ fromTrustedList xs = runST $ do
   ref <- newSTRef 0
   fromListWithGen ref askForEntropyST const xs
 
+-- | Returns the value associated with the key in the map.
 lookup :: Bytes -> Map v -> Maybe v
 {-# inline lookup #-}
 lookup
@@ -95,6 +107,14 @@ lookup
       (# (# #) | #) -> Nothing
       (# | v #) -> Just v
 
+-- One compelling optimization done here is that we use sameByteArray
+-- to check if the sources of entropy are pointer-wise equal. This is
+-- a very inexpensive check, and it ends up being true close to 50%
+-- of the time. If it is true, we can avoid hashing a second time.
+-- which avoids reading from a place in memory that is essentially
+-- random. One way to further improve the performance of this library
+-- would be to try to get doubleton buckets to use entropyA by searching
+-- for a suitable offset.
 lookup# ::
      (# ByteArray#, Int#, Int# #)
   -> (# ByteArray#, ArrayArray#, ByteArray#, ArrayArray#, SmallArray# v #)
@@ -103,15 +123,21 @@ lookup# ::
 lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys#, vals# #)
   | sz == 0 = (# (# #) | #)
   | PM.sizeofByteArray entropyA < reqEntropy = (# (# #) | #)
-  | ixA <- w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz)),
-    entropyB <- PM.indexUnliftedArray entropies ixA,
-    PM.sizeofByteArray entropyB >= reqEntropy,
-    ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz)),
-    offset <- fromIntegral @Int32 @Int (PM.indexPrimArray offsets ixA),
-    offsetIx <- offset + ix,
-    bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx),
-    (# v #) <- PM.indexSmallArray## vals offsetIx = (# | v #)
-  | otherwise = (# (# #) | #)
+  | ixA <- w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz))
+  , entropyB <- PM.indexUnliftedArray entropies ixA
+  , offset <- fromIntegral @Int32 @Int (PM.indexPrimArray offsets ixA) =
+      case sameByteArray entropyA entropyB of
+        1# | ix <- ixA
+           , offsetIx <- offset + ix
+           , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
+           , !(# v #) <- PM.indexSmallArray## vals offsetIx -> (# | v #)
+           | otherwise -> (# (# #) | #)
+        _  | PM.sizeofByteArray entropyB >= reqEntropy
+           , ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz))
+           , offsetIx <- offset + ix
+           , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
+           , !(# v #) <- PM.indexSmallArray## vals offsetIx -> (# | v #)
+           | otherwise -> (# (# #) | #)
   where
   sz = PM.sizeofUnliftedArray entropies
   reqEntropy = w2i (requiredEntropy (i2w (Bytes.length key)))
@@ -183,7 +209,7 @@ fromListWithGen h ask combine xs
               -- As a space optimization, we try out all options from the cache.
               -- If we can reuse random bytes that were used for a different key,
               -- we can save a lot of space. Reuse is frequently possible.
-              e <- runExceptT $ for_ cache $ \entropy -> if PM.sizeofByteArray entropy >= reqEntrSz 
+              e <- runExceptT $ for_ (entropyA : cache) $ \entropy -> if PM.sizeofByteArray entropy >= reqEntrSz 
                 then ExceptT $ attempt entropy ix keyVals >>= \case
                   True -> pure (Left ())
                   False -> pure (Right ())
@@ -230,7 +256,12 @@ fromListWithGen h ask combine xs
                   (map fst keyVals)
                   ((fmap.fmap.fmap) fst groups)
                 _ -> goD cache (counter - 1) ix keyVals entropySz zs
-      goB [entropyA] groups
+      -- Notice that we do not start out with entropyA. We manually cons that
+      -- onto the top every time, so that if it can get reused, it does. We
+      -- would rather it get reused than anything else since there is an
+      -- optimization in the lookup function that avoids computing the hash
+      -- twice if this entropy gets used.
+      goB [] groups
       vals' <- PM.unsafeFreezeSmallArray values
       keys' <- PM.unsafeFreezeUnliftedArray keys
       entropies' <- PM.unsafeFreezeUnliftedArray entropies
@@ -380,3 +411,7 @@ distribution (Map entropy entropies _ keys _) =
 distinctEntropies :: Map v -> Int
 distinctEntropies (Map entropy entropies _ _ _) =
   List.length (List.group (List.sort (entropy : Exts.toList entropies)))
+
+sameByteArray :: ByteArray -> ByteArray -> Int#
+sameByteArray (ByteArray x) (ByteArray y) =
+  Exts.sameMutableByteArray# (Exts.unsafeCoerce# x) (Exts.unsafeCoerce# y)

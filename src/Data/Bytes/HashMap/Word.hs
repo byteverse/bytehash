@@ -33,6 +33,7 @@ import System.Entropy (CryptHandle)
 import qualified Data.Bytes as Bytes
 import qualified Data.Bytes.Hash as Hash
 import qualified Data.Bytes.HashMap as Lifted
+import qualified Data.Bytes.HashMap.Internal as Lifted
 import qualified Data.List as List
 import qualified Data.Primitive as PM
 import qualified Data.Primitive.Unlifted.Array as PM
@@ -87,15 +88,21 @@ lookup# ::
 lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys#, vals# #)
   | sz == 0 = (# (# #) | #)
   | PM.sizeofByteArray entropyA < reqEntropy = (# (# #) | #)
-  | ixA <- w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz)),
-    entropyB <- PM.indexUnliftedArray entropies ixA,
-    PM.sizeofByteArray entropyB >= reqEntropy,
-    ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz)),
-    offset <- fromIntegral @Int32 @Int (PM.indexPrimArray offsets ixA),
-    offsetIx <- offset + ix,
-    bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx),
-    W# v <- PM.indexPrimArray vals offsetIx = (# | v #)
-  | otherwise = (# (# #) | #)
+  | ixA <- w2i (unsafeRem (upW32 (Hash.bytes entropyA key)) (i2w sz))
+  , entropyB <- PM.indexUnliftedArray entropies ixA
+  , offset <- fromIntegral @Int32 @Int (PM.indexPrimArray offsets ixA) =
+      case sameByteArray entropyA entropyB of
+        1# | ix <- ixA
+           , offsetIx <- offset + ix
+           , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
+           , !(W# v) <- PM.indexPrimArray vals offsetIx -> (# | v #)
+           | otherwise -> (# (# #) | #)
+        _  | PM.sizeofByteArray entropyB >= reqEntropy
+           , ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz))
+           , offsetIx <- offset + ix
+           , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
+           , !(W# v) <- PM.indexPrimArray vals offsetIx -> (# | v #)
+           | otherwise -> (# (# #) | #)
   where
   sz = PM.sizeofUnliftedArray entropies
   reqEntropy = w2i (requiredEntropy (i2w (Bytes.length key)))
@@ -138,3 +145,7 @@ distribution (Map entropy entropies offsets keys vals) = Lifted.distribution
 distinctEntropies :: Map -> Int
 distinctEntropies (Map entropy entropies _ _ _) =
   List.length (List.group (List.sort (entropy : Exts.toList entropies)))
+
+sameByteArray :: ByteArray -> ByteArray -> Int#
+sameByteArray (ByteArray x) (ByteArray y) =
+  Exts.sameMutableByteArray# (Exts.unsafeCoerce# x) (Exts.unsafeCoerce# y)
