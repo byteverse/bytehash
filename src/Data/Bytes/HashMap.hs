@@ -17,6 +17,7 @@
 -- | Implementation of static hash map data structure.
 module Data.Bytes.HashMap
   ( Map
+  , empty
   , lookup
   , fromList
   , fromTrustedList
@@ -96,6 +97,10 @@ fromTrustedList :: [(Bytes,v)] -> Map v
 fromTrustedList xs = runST $ do
   ref <- newSTRef 0
   fromListWithGen ref askForEntropyST const xs
+
+-- | An empty @Map@.
+empty :: Map v
+empty = Map mempty mempty mempty mempty mempty
 
 -- | Returns the value associated with the key in the map.
 lookup :: Bytes -> Map v -> Maybe v
