@@ -30,7 +30,7 @@ library
   build-depends:
     , base >=4.12 && <5
     , byte-order >=0.1.2 && <0.2
-    , primitive >=0.7 && <0.8
+    , primitive >=0.7 && <0.9
     , primitive-unlifted >=0.1.2 && <0.2
     , byteslice >=0.2.1 && <0.3
     , entropy >=0.4.1.5 && <0.5
