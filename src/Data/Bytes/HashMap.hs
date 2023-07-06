@@ -64,10 +64,11 @@ import Data.Int (Int32)
 import Data.Ord (Down(Down))
 import Data.Primitive (ByteArray(..),PrimArray(..))
 import Data.Primitive.SmallArray (SmallArray(..))
-import Data.Primitive.Unlifted.Array (UnliftedArray(..))
+import Data.Primitive.Unlifted.Array (UnliftedArray,UnliftedArray_(UnliftedArray))
+import Data.Primitive.Unlifted.Array.Primops (UnliftedArray#)
 import Data.STRef (STRef,newSTRef,writeSTRef,readSTRef)
 import Foreign.Ptr (plusPtr)
-import GHC.Exts (Ptr(Ptr),Int(I#),SmallArray#,ByteArray#,ArrayArray#,Int#)
+import GHC.Exts (Ptr(Ptr),Int(I#),SmallArray#,ByteArray#,Int#)
 import GHC.Exts (RealWorld)
 import GHC.IO (ioToST)
 import GHC.Word (Word(W#),Word32,Word8)
@@ -122,7 +123,7 @@ lookup
 -- for a suitable offset.
 lookup# ::
      (# ByteArray#, Int#, Int# #)
-  -> (# ByteArray#, ArrayArray#, ByteArray#, ArrayArray#, SmallArray# v #)
+  -> (# ByteArray#, UnliftedArray# ByteArray#, ByteArray#, UnliftedArray# ByteArray#, SmallArray# v #)
   -> (# (# #) | v #)
 {-# noinline lookup# #-}
 lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys#, vals# #)

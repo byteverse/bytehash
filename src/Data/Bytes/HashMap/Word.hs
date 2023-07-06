@@ -25,9 +25,10 @@ import Prelude hiding (lookup)
 import Data.Bytes.Types (Bytes(Bytes))
 import Data.Int (Int32)
 import Data.Primitive (ByteArray,ByteArray(..),PrimArray(..))
-import GHC.Exts (Int(I#),ByteArray#,ArrayArray#,Int#,Word#)
+import GHC.Exts (Int(I#),ByteArray#,Int#,Word#)
 import GHC.Word (Word(W#),Word32)
-import Data.Primitive.Unlifted.Array (UnliftedArray(..))
+import Data.Primitive.Unlifted.Array (UnliftedArray,UnliftedArray_(UnliftedArray))
+import Data.Primitive.Unlifted.Array.Primops (UnliftedArray#)
 import System.Entropy (CryptHandle)
 
 import qualified Data.Bytes as Bytes
@@ -82,7 +83,7 @@ lookup
 
 lookup# ::
      (# ByteArray#, Int#, Int# #)
-  -> (# ByteArray#, ArrayArray#, ByteArray#, ArrayArray#, ByteArray# #)
+  -> (# ByteArray#, UnliftedArray# ByteArray#, ByteArray#, UnliftedArray# ByteArray#, ByteArray# #)
   -> (# (# #) | Word# #)
 {-# noinline lookup# #-}
 lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys#, vals# #)
