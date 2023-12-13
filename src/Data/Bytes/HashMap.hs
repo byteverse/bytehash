@@ -22,6 +22,7 @@ module Data.Bytes.HashMap
   , fromList
   , fromTrustedList
   , fromListWith
+  , elements
     -- * Used for testing
   , HashMapException(..)
   , distribution
@@ -79,10 +80,25 @@ import qualified Data.ByteString.Unsafe as ByteString
 import qualified Data.Bytes as Bytes
 import qualified Data.Bytes.Hash as Hash
 import qualified Data.List as List
+import qualified Data.Map.Strict as Map
 import qualified Data.Primitive as PM
 import qualified Data.Primitive.Ptr as PM
 import qualified Data.Primitive.Unlifted.Array as PM
 import qualified GHC.Exts as Exts
+
+-- | Recover the elements of the hashmap. These are ordered
+-- lexicographically by their corresponding keys. That is, this
+-- function returns the same output regardless of the entropy used
+-- to build the hashmap.
+elements :: Map v -> [v]
+elements (Map _ _ _ keys vals) = Map.elems (go Map.empty (PM.sizeofSmallArray vals - 1))
+  where
+  go !acc !ix = case ix of
+    (-1) -> acc
+    _ ->
+      let !k = PM.indexUnliftedArray keys ix
+          !v = PM.indexSmallArray vals ix
+       in Map.insert k v acc
 
 -- | Build a static hash map. This may be used on input that comes
 -- from an adversarial user. It always produces a perfect hash map.
@@ -285,13 +301,12 @@ fromListWithGen h ask combine xs
   count = List.length @[] xs' :: Int
 
 findUnused :: PM.SmallMutableArray s Bool -> ST s Int
-findUnused xs = go 0
+findUnused xs = PM.getSizeofSmallMutableArray xs >>= go 0
   where
-  len = PM.sizeofSmallMutableArray xs
-  go !ix = if ix < len
+  go !ix !len = if ix < len
     then do
       PM.readSmallArray xs ix >>= \case
-        True -> go (ix + 1)
+        True -> go (ix + 1) len
         False -> pure ix
     else error "findUnused: could not find unused slot"
 
