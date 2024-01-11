@@ -68,13 +68,6 @@ byteArray ::
   -> Word32
 byteArray !addr !b = bytes addr (Bytes.fromByteArray b)
 
-wordSize :: Int
-wordSize = sizeOf (undefined :: Word)
-
-byteSwap :: Word -> Word
-{-# inline byteSwap #-}
-byteSwap (W# w) = W# (Exts.byteSwap# w)
-
 -- | Statically defined source of entropy. Exactly 16384 bytes.
 entropy :: Ptr Word8
 entropy = Ptr "\

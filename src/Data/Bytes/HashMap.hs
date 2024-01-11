@@ -98,7 +98,7 @@ elements (Map _ _ _ keys vals) = Map.elems (go Map.empty (PM.sizeofSmallArray va
     _ ->
       let !k = PM.indexUnliftedArray keys ix
           !v = PM.indexSmallArray vals ix
-       in Map.insert k v acc
+       in go (Map.insert k v acc) (ix - 1)
 
 -- | Build a static hash map. This may be used on input that comes
 -- from an adversarial user. It always produces a perfect hash map.
