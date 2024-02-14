@@ -15,6 +15,7 @@ module Data.Bytes.HashMap.Word
   , fromList
   , fromTrustedList
   , fromListWith
+
     -- * Used for testing
   , distribution
   , distinctEntropies
@@ -22,13 +23,13 @@ module Data.Bytes.HashMap.Word
 
 import Prelude hiding (lookup)
 
-import Data.Bytes.Types (Bytes(Bytes))
+import Data.Bytes.Types (Bytes (Bytes))
 import Data.Int (Int32)
-import Data.Primitive (ByteArray,ByteArray(..),PrimArray(..))
-import GHC.Exts (Int(I#),ByteArray#,Int#,Word#)
-import GHC.Word (Word(W#),Word32)
-import Data.Primitive.Unlifted.Array (UnliftedArray,UnliftedArray_(UnliftedArray))
+import Data.Primitive (ByteArray (..), PrimArray (..))
+import Data.Primitive.Unlifted.Array (UnliftedArray, UnliftedArray_ (UnliftedArray))
 import Data.Primitive.Unlifted.Array.Primops (UnliftedArray#)
+import GHC.Exts (ByteArray#, Int (I#), Int#, Word#)
+import GHC.Word (Word (W#), Word32)
 import System.Entropy (CryptHandle)
 
 import qualified Data.Bytes as Bytes
@@ -40,52 +41,56 @@ import qualified Data.Primitive as PM
 import qualified Data.Primitive.Unlifted.Array as PM
 import qualified GHC.Exts as Exts
 
--- | A static perfect hash table where the keys are byte arrays. This
---   table cannot be updated after its creation, but all lookups have
---   guaranteed O(1) worst-case cost. It consumes linear space. This
---   is an excellent candidate for use with compact regions.
-data Map = Map
-  !ByteArray -- top-level entropy
-  !(UnliftedArray ByteArray) -- entropies
-  !(PrimArray Int32) -- offset to apply to hash, could probably be 32 bits
-  !(UnliftedArray ByteArray) -- keys
-  !(PrimArray Word) -- values
+{- | A static perfect hash table where the keys are byte arrays. This
+  table cannot be updated after its creation, but all lookups have
+  guaranteed O(1) worst-case cost. It consumes linear space. This
+  is an excellent candidate for use with compact regions.
+-}
+data Map
+  = Map
+      !ByteArray -- top-level entropy
+      !(UnliftedArray ByteArray) -- entropies
+      !(PrimArray Int32) -- offset to apply to hash, could probably be 32 bits
+      !(UnliftedArray ByteArray) -- keys
+      !(PrimArray Word) -- values
 
 fromLifted :: Lifted.Map Word -> Map
 fromLifted (Lifted.Map a b c d e) = Map a b c d (Exts.fromList (Exts.toList e))
 
-fromList :: CryptHandle -> [(Bytes,Word)] -> IO Map
+fromList :: CryptHandle -> [(Bytes, Word)] -> IO Map
 fromList h = fmap fromLifted . Lifted.fromList h
 
 fromListWith ::
-     CryptHandle -- ^ Source of randomness
-  -> (Word -> Word -> Word)
-  -> [(Bytes,Word)]
-  -> IO Map
+  -- | Source of randomness
+  CryptHandle ->
+  (Word -> Word -> Word) ->
+  [(Bytes, Word)] ->
+  IO Map
 fromListWith h c xs = fmap fromLifted (Lifted.fromListWith h c xs)
 
--- | Build a map from keys that are known at compile time.
--- All keys must be 64 bytes or less. This uses a built-in source
--- of entropy and is entirely deterministic. An adversarial user
--- could feed this function keys that cause it to error out rather
--- than completing.
-fromTrustedList :: [(Bytes,Word)] -> Map
+{- | Build a map from keys that are known at compile time.
+All keys must be 64 bytes or less. This uses a built-in source
+of entropy and is entirely deterministic. An adversarial user
+could feed this function keys that cause it to error out rather
+than completing.
+-}
+fromTrustedList :: [(Bytes, Word)] -> Map
 fromTrustedList = fromLifted . Lifted.fromTrustedList
 
 lookup :: Bytes -> Map -> Maybe Word
-{-# inline lookup #-}
+{-# INLINE lookup #-}
 lookup
   (Bytes (ByteArray keyArr) (I# keyOff) (I# keyLen))
   (Map (ByteArray entropyA) (UnliftedArray entropies) (PrimArray offsets) (UnliftedArray keys) (PrimArray vals)) =
-    case lookup# (# keyArr,keyOff,keyLen #) (# entropyA,entropies,offsets,keys,vals #) of
+    case lookup# (# keyArr, keyOff, keyLen #) (# entropyA, entropies, offsets, keys, vals #) of
       (# (# #) | #) -> Nothing
       (# | v #) -> Just (W# v)
 
 lookup# ::
-     (# ByteArray#, Int#, Int# #)
-  -> (# ByteArray#, UnliftedArray# ByteArray#, ByteArray#, UnliftedArray# ByteArray#, ByteArray# #)
-  -> (# (# #) | Word# #)
-{-# noinline lookup# #-}
+  (# ByteArray#, Int#, Int# #) ->
+  (# ByteArray#, UnliftedArray# ByteArray#, ByteArray#, UnliftedArray# ByteArray#, ByteArray# #) ->
+  (# (# #) | Word# #)
+{-# NOINLINE lookup# #-}
 lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys#, vals# #)
   | sz == 0 = (# (# #) | #)
   | PM.sizeofByteArray entropyA < reqEntropy = (# (# #) | #)
@@ -93,18 +98,22 @@ lookup# (# keyArr#, keyOff#, keyLen# #) (# entropyA#, entropies#, offsets#, keys
   , entropyB <- PM.indexUnliftedArray entropies ixA
   , offset <- fromIntegral @Int32 @Int (PM.indexPrimArray offsets ixA) =
       case sameByteArray entropyA entropyB of
-        1# | ix <- ixA
-           , offsetIx <- offset + ix
-           , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
-           , !(W# v) <- PM.indexPrimArray vals offsetIx -> (# | v #)
-           | otherwise -> (# (# #) | #)
-        _  | PM.sizeofByteArray entropyB >= reqEntropy
-           , ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz))
-           , offsetIx <- offset + ix
-           , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
-           , !(W# v) <- PM.indexPrimArray vals offsetIx -> (# | v #)
-           | otherwise -> (# (# #) | #)
-  where
+        1#
+          | ix <- ixA
+          , offsetIx <- offset + ix
+          , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
+          , !(W# v) <- PM.indexPrimArray vals offsetIx ->
+              (# | v #)
+          | otherwise -> (# (# #) | #)
+        _
+          | PM.sizeofByteArray entropyB >= reqEntropy
+          , ix <- w2i (unsafeRem (upW32 (Hash.bytes entropyB key)) (i2w sz))
+          , offsetIx <- offset + ix
+          , bytesEqualsByteArray key (PM.indexUnliftedArray keys offsetIx)
+          , !(W# v) <- PM.indexPrimArray vals offsetIx ->
+              (# | v #)
+          | otherwise -> (# (# #) | #)
+ where
   sz = PM.sizeofUnliftedArray entropies
   reqEntropy = w2i (requiredEntropy (i2w (Bytes.length key)))
   key = Bytes (ByteArray keyArr#) (I# keyOff#) (I# keyLen#)
@@ -126,7 +135,7 @@ requiredEntropy n = 8 * n + 8
 w2i :: Word -> Int
 w2i = fromIntegral
 
-bytesEqualsByteArray :: Bytes -> ByteArray -> Bool 
+bytesEqualsByteArray :: Bytes -> ByteArray -> Bool
 bytesEqualsByteArray (Bytes arr1 off1 len1) arr2
   | len1 /= PM.sizeofByteArray arr2 = False
   | otherwise = compareByteArrays arr1 off1 arr2 0 len1 == EQ
@@ -138,9 +147,10 @@ compareByteArrays (ByteArray ba1#) (I# off1#) (ByteArray ba2#) (I# off2#) (I# n#
 upW32 :: Word32 -> Word
 upW32 = fromIntegral
 
-distribution :: Map -> [(Int,Int)]
-distribution (Map entropy entropies offsets keys vals) = Lifted.distribution
-  (Lifted.Map entropy entropies offsets keys (Exts.fromList (Exts.toList vals)))
+distribution :: Map -> [(Int, Int)]
+distribution (Map entropy entropies offsets keys vals) =
+  Lifted.distribution
+    (Lifted.Map entropy entropies offsets keys (Exts.fromList (Exts.toList vals)))
 
 -- | The number of non-matching entropies being used.
 distinctEntropies :: Map -> Int
